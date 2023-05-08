@@ -6,16 +6,22 @@
 
 void f (uint8_t* d) {
 	static int i = 0;
+	static int j = 0;
 	
-	d[0] = 0xff - 8 * i;
-	d[1] = (i == 0 || i == 28) ? 0xff : 0;
-	d[2] = 0 + 8 * i;
-
-	i++;
-	if(i >= 29)
+	if (i <= 27) {
+		int s = i == (j%28);
+		d[0] = (s) ? 0 : 0xff - 8 * i;
+		// d[0] = 0;
+		d[1] = (i == 0 || i == 27 || s) ? 0xff : 0;
+		d[2] = (s) ? 0 : 0 + 8 * i;
+		//d[2] = 0;
+		i++;
+	} else{
+		d[0] = 0x00; d[1] = 0x00; d[2] = 0x00;
 		i = 0;
+		j++;
+	}
 }
-
 
 int main(void){
 	//rcc_clock_setup_in_hse_8mhz_out_72mhz();
@@ -71,7 +77,7 @@ int main(void){
 				 ((d[i]>>0 & 1) << 1) ); 
 			}
 		}
-		for(int i = 0 ; i < 0x0ffffff; i ++) __asm__("nop");
+		for(int i = 0 ; i < 0x00fffff; i ++) __asm__("nop");
 	}
 	return 0;
 }
