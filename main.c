@@ -2,154 +2,86 @@
 #include<libopencm3/stm32/flash.h>
 #include<libopencm3/stm32/gpio.h>
 #include<libopencm3/stm32/spi.h>
+#include<libopencm3/stm32/dma.h>
 #include<libopencm3/cm3/nvic.h>
 #include<libopencm3/cm3/assert.h>
 
-#define DO_INT 0
+#define OP_MODE_DMA 2
+#define OP_MODE_INT 1
+#define OP_MODE_POL 0
 
-void f (uint8_t* d, int i) {
-	static int j = 0; // iteration counter
+#define OP_MODE 2
 
-	if (i <= 27) {
-		int s = (i == (j%28)); // position of wandering single red dot
-		// d[0] = (s) ? 0 : (0xff - 9 * i); // green
-		d[0] = (s) ? 0 : 0xff- (0xff >> (i>>2)); // green
-		d[1] = (i == 0 || i == 27 || s) ? 0xff : 0; // red
-		//d[2] = (s) ? 0 : (0 + 4 * i); // blue
-		d[2] = (s) ? 0 : (0xff - 9 * i); // blue
-	} else{
-		d[0] = 0x00; d[1] = 0x00; d[2] = 0x00;
-		j++;
+#include "neopixel.h"
+
+#if OP_MODE == OP_MODE_INT
+	#include"interrupt.h"
+#endif
+
+#define DMA_PORT DMA1
+#define DMA_CHAN DMA_CHANNEL3
+
+
+void dma1_channel3_isr(void) {
+	if ((DMA1_ISR & DMA_ISR_TCIF3) != 0) { // transfer complete
+		DMA1_IFCR |= DMA_IFCR_CTCIF3; // clear flag
+
+		dma_disable_channel(DMA_PORT, DMA_CHAN);
+		gpio_set(GPIOC, GPIO13);
 	}
+	if ((DMA1_ISR & DMA_ISR_TEIF3) != 0) // transfer error
+		DMA1_IFCR |= DMA_IFCR_CTEIF3;
+	if ((DMA1_ISR & DMA_ISR_GIF3) != 0)
+		DMA1_IFCR |= DMA_IFCR_CGIF3;
 }
 
-void prepare_next_byte(uint8_t* write, uint8_t* d, signed int i) {
-	write[0] = 0b10010010;
-	write[1] = 0b01001001;
-	write[2] = 0b00100100;
-	write[0] |= (((d[i] & (1<<7)) >> 1) | // ((d[i]>>7 & 1) << 6) |
-		 ((d[i] & (1<<6)) >> 3) | // ((d[i]>>6 & 1) << 3) |
-		 ((d[i] & (1<<5)) >> 5)); // ((d[i]>>5 & 1) << 0));
-	write[1] |= (((d[i] & (1<<4)) << 1) | // ((d[i]>>4 & 1) << 5) |
-		 ((d[i] & (1<<3)) >> 1)); // ((d[i]>>3 & 1) << 2));
-	write[2] |= (((d[i] & 1<<2) << 5) | // ((d[i]>>2 & 1) << 7) |
-		 ((d[i] & (1<<1)) << 3) | // ((d[i]>>1 & 1) << 4) |
-		 ((d[i] & (1<<0)) << 1)); // ((d[i]>>0 & 1) << 1));
-
-	// assert that IR did not take too long
-	/*
-	cm3_assert((SPI_SR(SPI1) & SPI_SR_BSY) || // still busy sending
-		(h == 0 && i == 0 && j == 0));
-	cm3_assert((!(SPI_SR(SPI1) & SPI_SR_TXE)) || // SR not empty (optional)
-		(h == 0 && i == 0 && j == 0)); 
-	*/
+void clear_dma_ir(){
+	if ((DMA1_ISR & DMA_ISR_TCIF3) != 0)
+		DMA1_IFCR |= DMA_IFCR_CTCIF3;
+	if ((DMA1_ISR & DMA_ISR_TEIF3) != 0)
+		DMA1_IFCR |= DMA_IFCR_CTEIF3;
+	if ((DMA1_ISR & DMA_ISR_GIF3) != 0)
+		DMA1_IFCR |= DMA_IFCR_CGIF3;
 }
 
 
-void spi1_isr(void){
-	static signed int h = -1; // byte part counter
-	static signed int i = -1; // byte counter
-	static int j=0; // led counter
+void init_dma(void* write, int write_sz) {
+	dma_channel_reset(DMA_PORT, DMA_CHAN);
+	dma_disable_channel(DMA_PORT, DMA_CHAN);
 
-	static uint8_t d[3];
+	// clear interrupt flags
+	clear_dma_ir();
 
-	static uint8_t write[3];
+	dma_set_peripheral_address(DMA_PORT, DMA_CHAN, (uint32_t) (&SPI_DR(SPI1)));
+	dma_set_memory_address(DMA_PORT, DMA_CHAN, (uint32_t) write);
+	dma_set_number_of_data(DMA_PORT, DMA_CHAN, write_sz);
 
-//	cm3_assert(SPI_SR(SPI1) & SPI_SR_TXE);
+	// DMA1_CCR(DMA_CHANNEL3) = DMA_CCR_MSIZE_8BIT | DMA_CCR_PSIZE_8BIT |
+	//	DMA_CCR_PL_LOW | DMA_CCR_MINC | DMA_CCR_DIR;
+	dma_set_peripheral_size(DMA_PORT, DMA_CHAN, DMA_CCR_PSIZE_8BIT);
+	dma_set_memory_size(DMA_PORT, DMA_CHAN, DMA_CCR_MSIZE_8BIT);
+	dma_set_priority(DMA_PORT, DMA_CHAN, DMA_CCR_PL_LOW);
+	dma_enable_memory_increment_mode(DMA_PORT, DMA_CHAN);
+	dma_set_read_from_memory(DMA_PORT, DMA_CHAN);
 
-repeat:
+	nvic_enable_irq(NVIC_DMA1_CHANNEL3_IRQ);
+	dma_enable_transfer_complete_interrupt(DMA_PORT, DMA_CHAN);
 
-	if (h >= 0) { // not at very first call
-		/*
-		cm3_assert((SPI_SR(SPI1) & SPI_SR_BSY) // assert still ongoing transfer
-			|| (h == 0 && i == 0 && j == 0)); // .. but not when starting :-)
-		*/
-		*((volatile uint8_t*) &(SPI_DR(SPI1))) = write[h];
-
-		h++;
-		if (h <= 2)
-			return; // i.e. send next byte part
-	}
-
-	// next byte
-	h = 0; // start from first byte part
-
-	if (i < 2) { // no new led -> just prepare next byte
-		i++; // increase led counter
-		prepare_next_byte(write, d, i);
-		if(SPI_SR(SPI1) & SPI_SR_TXE)
-			goto repeat;
-		return;
-	}
-	// next led
-	i = 0; // reset byte counter, byte part already reset
-
-	if (j <= 28){ // not @ end of LED -> prepare byte parts
-		j++; // increase led counter
-		f(d, j); // fetch new LED RGB data
-		prepare_next_byte(write, d, i);
-		if(SPI_SR(SPI1) & SPI_SR_TXE)
-			goto repeat;
-		return;
-	}
-
-	// start from new: stop interrupt and wait for it to be enabled again
-	j = 0;
-	h = -1;
-	i = -1;
-	spi_disable_tx_buffer_empty_interrupt(SPI1);
-
-} 
-
-/*
-void get_data(uint8_t* spibuf, uint8_t* d){
-	for (int color = 0; color < 3; color++) {
-		spibuf[color*3+2] = (0b10010010 |
-			((d[color]>>7 & 1) << 6) |
-			((d[color]>>6 & 1) << 3) |
-			((d[color]>>5 & 1) << 0) );
-		spibuf[color*3+1] = (0b01001001 |
-			((d[color]>>4 & 1) << 5) |
-			((d[color]>>3 & 1) << 2) );
-		spibuf[color*3] = (0b00100100 |
-			((d[color]>>2 & 1) << 7) |
-			((d[color]>>1 & 1) << 4) |
-			((d[color]>>0 & 1) << 1) );
-	}
+	spi_enable_tx_dma(SPI1);
 }
 
-void spi1_isr(void){
-	static int i=0;
-	static int j=0; // led counter
-	static uint8_t spibuf[3*3];
-
-	uint8_t d[3];
-
-	if (j == 0)	{
-		f(d, j);
-		get_data(spibuf, d);
-	}
-
-	*((volatile uint8_t*) &(SPI_DR(SPI1))) = spibuf[i++];
-	if (i >= 3*3){
-		i = 0;
-		j++;
-		f(d, j);
-		get_data(spibuf, d);
-		if (j >= 27){
-			j = 0;
-			spi_disable_tx_buffer_empty_interrupt(SPI1);
-			spi_disable(SPI1);
-		}
-	}
-}*/
-
-int main(void){
-	//rcc_clock_setup_in_hse_8mhz_out_72mhz();
-	rcc_clock_setup_pll(&rcc_hse_configs[RCC_CLOCK_HSE8_72MHZ]);
-
+/**
+ * initialize everything related to I/O pins, also enables GPIO clocks
+ **/
+void setup_gpio (void) {
+	rcc_periph_reset_pulse(RCC_AFIO);
+	rcc_periph_clock_enable(RCC_AFIO);
+	rcc_periph_reset_pulse(RCC_GPIOA);
 	rcc_periph_clock_enable(RCC_GPIOA);
+	rcc_periph_reset_pulse(RCC_GPIOC);
+	rcc_periph_clock_enable(RCC_GPIOC);
 
+	// GPIO A provides SPI pins MOSI and SCLK
 	gpio_clear(GPIOA, GPIO5);
 	gpio_clear(GPIOA, GPIO7);
 	gpio_set_mode(GPIOA, GPIO_MODE_OUTPUT_50_MHZ,
@@ -157,6 +89,17 @@ int main(void){
 	gpio_set_mode(GPIOA, GPIO_MODE_OUTPUT_50_MHZ,
 		GPIO_CNF_OUTPUT_ALTFN_PUSHPULL, GPIO7);
 
+	// bluepill green onboard LED
+	gpio_clear(GPIOC, GPIO13);
+	gpio_set_mode(GPIOC, GPIO_MODE_OUTPUT_50_MHZ,
+		GPIO_CNF_OUTPUT_PUSHPULL, GPIO13);
+}
+
+/**
+ * initialize SPI peripheral
+ * @note spi_enable() would start transfers, so we won't do that here
+ **/
+void setup_spi (void) {
 	rcc_periph_reset_pulse(RCC_SPI1);
 	rcc_periph_clock_enable(RCC_SPI1);
 
@@ -165,18 +108,40 @@ int main(void){
 	spi_init_master(SPI1, SPI_CR1_BAUDRATE_FPCLK_DIV_32,
 		SPI_CR1_CPOL_CLK_TO_0_WHEN_IDLE, SPI_CR1_CPHA_CLK_TRANSITION_1,
 		SPI_CR1_DFF_8BIT, SPI_CR1_MSBFIRST);
+}
 
-#if ! DO_INT
+#define write_sz 3*3*29
+
+int main(void){
+	rcc_clock_setup_pll(&rcc_hse_configs[RCC_CLOCK_HSE8_72MHZ]);
+
+	rcc_periph_reset_pulse(RCC_DMA1);
+	rcc_periph_clock_enable(RCC_DMA1);
+
+	setup_gpio();
+	setup_spi();
+
+
+#if OP_MODE == OP_MODE_POL
 	spi_enable(SPI1);
 
 	static uint8_t d[3];
 	static uint8_t write[3];
-#else
+#elif OP_MODE == OP_MODE_INT
 	nvic_enable_irq(NVIC_SPI1_IRQ);
+#elif OP_MODE == OP_MODE_DMA
+	static uint8_t d[3]; // FIXME
+	// const int write_sz = 3*3*29;
+	static uint8_t write[write_sz];
+
+	spi_enable(SPI1);
+
+	init_dma(write, write_sz);
+	spi_enable(SPI1);
 #endif
 
 	while(1){
-#if ! DO_INT
+#if OP_MODE == OP_MODE_POL
 		for(int j = 0 ; j < 29 ; j ++) {
 			f(d, j);
 			for(int i = 0 ; i <= 2; i++) {
@@ -186,9 +151,21 @@ int main(void){
 				spi_send(SPI1, write[2]);
 			}
 		}
-#else
+#elif OP_MODE == OP_MODE_INT
 		spi_enable(SPI1);
 		spi_enable_tx_buffer_empty_interrupt(SPI1);
+#elif OP_MODE == OP_MODE_DMA
+		// update data
+		for(int j = 0 ; j < 29 ; j ++) {
+			f(d, j);
+			for(int i = 0 ; i <= 2; i++)
+				prepare_next_byte(&write[(3*3*j)+3*i], d, i);
+		}
+		dma_set_number_of_data(DMA_PORT, DMA_CHAN, write_sz);
+
+		clear_dma_ir();
+		dma_enable_channel(DMA_PORT, DMA_CHAN); // start DMA request
+		gpio_clear(GPIOC, GPIO13);
 #endif
 		for(int i = 0 ; i < 0x00fffff; i ++) __asm__("nop");
 	}

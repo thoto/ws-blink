@@ -8,7 +8,7 @@ OPENCM3_DIR     = ./libopencm3/
 # LDLIBS          += -Wl,--start-group -lc -lgcc -lnosys -Wl,--end-group
 
 
-CFLAGS = -Wall -Wextra -g3
+CFLAGS = -Wall -Wextra -g3 -O0
 LDFLAGS = -static -nostartfiles
 # LDLIBS = -lc -lnosys # no newlib libc
 # LDLIBS = -lopencm3_stm32f1
